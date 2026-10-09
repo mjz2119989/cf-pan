@@ -1,7 +1,13 @@
 name = "cf-pan"
 main = "src/index.js"
 compatibility_date = "2026-01-01"
+workers_dev = true
+
+routes = [
+  { pattern = "pan.longhuai.dpdns.org", custom_domain = true }
+]
 
 [vars]
 B2_ENDPOINT = "s3.us-east-005.backblazeb2.com"
 B2_BUCKET = "cf-pan-mj"
+
