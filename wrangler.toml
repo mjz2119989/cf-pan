@@ -2,6 +2,6 @@ name = "cf-pan"
 main = "src/index.js"
 compatibility_date = "2026-01-01"
 
-[[r2_buckets]]
-binding = "BUCKET"
-bucket_name = "cf-pan"
+[vars]
+B2_ENDPOINT = "s3.us-west-004.backblazeb2.com"
+B2_BUCKET = "cf-pan-mj"
