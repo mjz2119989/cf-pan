@@ -1,8 +1,9 @@
-// cf-pan: 基于 Cloudflare Workers + R2 的个人网盘
-// 环境变量（Secrets）：PASSWORD 登录密码，SECRET 签名密钥（随机长字符串）
-// 绑定：BUCKET -> R2 存储桶
+// cf-pan: 基于 Cloudflare Workers + Backblaze B2（S3 兼容）的个人网盘
+// Secrets：PASSWORD 登录密码，SECRET 签名密钥，B2_KEY_ID / B2_APP_KEY B2 应用密钥
+// 变量：B2_ENDPOINT（如 s3.us-west-004.backblazeb2.com），B2_BUCKET 桶名
 
 import { PAGE } from "./page.js";
+import { S3 } from "./s3.js";
 
 const COOKIE = "pan_auth";
 const SESSION_DAYS = 30;
@@ -69,27 +70,28 @@ function cleanKey(k) {
 }
 
 async function serveObject(req, env, key, asAttachment) {
-  const obj = await env.BUCKET.get(key, { range: req.headers, onlyIf: req.headers });
-  if (obj === null) return new Response("文件不存在", { status: 404 });
+  const res = await store(env).get(key, req.headers);
+  if (res.status === 404) return new Response("文件不存在", { status: 404 });
+  if (res.status === 304) return new Response(null, { status: 304 });
+  if (!res.ok) return new Response("读取失败 " + res.status, { status: 502 });
   const headers = new Headers();
-  obj.writeHttpMetadata(headers);
-  headers.set("etag", obj.httpEtag);
+  for (const n of ["content-type", "content-length", "content-range", "etag", "last-modified"]) {
+    const v = res.headers.get(n);
+    if (v) headers.set(n, v);
+  }
   headers.set("accept-ranges", "bytes");
   const name = key.split("/").pop();
   headers.set(
     "content-disposition",
     `${asAttachment ? "attachment" : "inline"}; filename*=UTF-8''${encodeURIComponent(name)}`
   );
-  if (!("body" in obj)) return new Response(null, { status: 304, headers });
-  if (obj.range && req.headers.has("range")) {
-    const start = obj.range.offset ?? 0;
-    const len = obj.range.length ?? obj.size - start;
-    headers.set("content-range", `bytes ${start}-${start + len - 1}/${obj.size}`);
-    headers.set("content-length", String(len));
-    return new Response(obj.body, { status: 206, headers });
-  }
-  headers.set("content-length", String(obj.size));
-  return new Response(obj.body, { headers });
+  return new Response(res.body, { status: res.status, headers });
+}
+
+let _s3;
+function store(env) {
+  if (!_s3) _s3 = new S3(env);
+  return _s3;
 }
 
 async function listDir(env, prefix) {
@@ -97,10 +99,10 @@ async function listDir(env, prefix) {
   const files = [];
   let cursor;
   do {
-    const res = await env.BUCKET.list({ prefix, delimiter: "/", cursor, limit: 1000 });
+    const res = await store(env).list({ prefix, delimiter: "/", cursor });
     for (const p of res.delimitedPrefixes) folders.add(p);
     for (const o of res.objects) {
-      if (o.key.endsWith("/.keep")) continue;
+      if (o.key.endsWith("/.keep") || o.key === prefix) continue;
       files.push({ key: o.key, size: o.size, uploaded: o.uploaded });
     }
     cursor = res.truncated ? res.cursor : undefined;
@@ -109,23 +111,21 @@ async function listDir(env, prefix) {
 }
 
 async function deletePrefix(env, prefix) {
-  let cursor, count = 0;
-  do {
-    const res = await env.BUCKET.list({ prefix, cursor, limit: 1000 });
-    const keys = res.objects.map((o) => o.key);
-    if (keys.length) {
-      await env.BUCKET.delete(keys);
-      count += keys.length;
-    }
-    cursor = res.truncated ? res.cursor : undefined;
-  } while (cursor);
+  let count = 0;
+  for (;;) {
+    const res = await store(env).list({ prefix });
+    if (!res.objects.length) break;
+    await Promise.all(res.objects.map((o) => store(env).delete(o.key)));
+    count += res.objects.length;
+    if (!res.truncated) break;
+  }
   return count;
 }
 
 export default {
   async fetch(req, env) {
-    if (!env.PASSWORD || !env.SECRET) {
-      return new Response("请先设置 PASSWORD 和 SECRET 两个 Secret", { status: 500 });
+    if (!env.PASSWORD || !env.SECRET || !env.B2_KEY_ID || !env.B2_APP_KEY) {
+      return new Response("请先设置 PASSWORD、SECRET、B2_KEY_ID、B2_APP_KEY 四个 Secret", { status: 500 });
     }
     const url = new URL(req.url);
     const p = url.pathname;
@@ -180,7 +180,7 @@ export default {
       if (p === "/api/mkdir" && req.method === "POST") {
         const dir = cleanKey(q.get("path")).replace(/\/+$/, "");
         if (!dir) return json({ error: "名称为空" }, 400);
-        await env.BUCKET.put(dir + "/.keep", "");
+        await store(env).put(dir + "/.keep", "", "text/plain");
         return json({ ok: true });
       }
 
@@ -190,14 +190,14 @@ export default {
         if (!key) return json({ error: "缺少 key" }, 400);
         if (req.method === "GET") return serveObject(req, env, key, q.get("dl") === "1");
         if (req.method === "PUT") {
-          await env.BUCKET.put(key, req.body, {
-            httpMetadata: { contentType: req.headers.get("content-type") || "application/octet-stream" },
-          });
+          const len = req.headers.get("content-length");
+          if (!len) return json({ error: "缺少 Content-Length" }, 411);
+          await store(env).put(key, req.body || "", req.headers.get("content-type"), len);
           return json({ ok: true });
         }
         if (req.method === "DELETE") {
           if (key.endsWith("/")) return json({ deleted: await deletePrefix(env, key) });
-          await env.BUCKET.delete(key);
+          await store(env).delete(key);
           return json({ ok: true });
         }
       }
@@ -205,25 +205,20 @@ export default {
       // 大文件分片上传
       if (p === "/api/mpu/create" && req.method === "POST") {
         const key = cleanKey(q.get("key"));
-        const mpu = await env.BUCKET.createMultipartUpload(key, {
-          httpMetadata: { contentType: q.get("type") || "application/octet-stream" },
-        });
-        return json({ uploadId: mpu.uploadId });
+        return json({ uploadId: await store(env).createMultipart(key, q.get("type")) });
       }
       if (p === "/api/mpu/part" && req.method === "PUT") {
-        const mpu = env.BUCKET.resumeMultipartUpload(cleanKey(q.get("key")), q.get("uploadId"));
-        const part = await mpu.uploadPart(Number(q.get("part")), req.body);
-        return json(part);
+        const len = req.headers.get("content-length");
+        if (!len) return json({ error: "缺少 Content-Length" }, 411);
+        return json(await store(env).uploadPart(cleanKey(q.get("key")), q.get("uploadId"), Number(q.get("part")), req.body, len));
       }
       if (p === "/api/mpu/complete" && req.method === "POST") {
-        const mpu = env.BUCKET.resumeMultipartUpload(cleanKey(q.get("key")), q.get("uploadId"));
         const { parts } = await req.json();
-        await mpu.complete(parts);
+        await store(env).completeMultipart(cleanKey(q.get("key")), q.get("uploadId"), parts);
         return json({ ok: true });
       }
       if (p === "/api/mpu/abort" && req.method === "POST") {
-        const mpu = env.BUCKET.resumeMultipartUpload(cleanKey(q.get("key")), q.get("uploadId"));
-        await mpu.abort();
+        await store(env).abortMultipart(cleanKey(q.get("key")), q.get("uploadId"));
         return json({ ok: true });
       }
 
