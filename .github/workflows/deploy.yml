@@ -1,8 +1,6 @@
 name: Deploy
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -14,9 +12,3 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          secrets: |
-            PASSWORD
-            SECRET
-        env:
-          PASSWORD: ${{ secrets.PAN_PASSWORD }}
-          SECRET: ${{ secrets.PAN_SECRET }}
