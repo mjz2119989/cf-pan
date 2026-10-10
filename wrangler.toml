@@ -4,7 +4,8 @@ compatibility_date = "2026-01-01"
 workers_dev = true
 
 routes = [
-  { pattern = "pan.longhuai.dpdns.org", custom_domain = true }
+  { pattern = "pan.longhuai.dpdns.org", custom_domain = true },
+  { pattern = "pan.msmj.de5.net", custom_domain = true }
 ]
 
 [vars]
